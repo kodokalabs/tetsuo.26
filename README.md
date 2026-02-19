@@ -1,6 +1,6 @@
 # 🤖 Autonomous Agent
 
-An OpenClaw-inspired autonomous AI agent built from scratch in TypeScript. Local-first, multi-channel, tool-using, self-extending, security-hardened — with a web admin dashboard for runtime control.
+An autonomous AI agent built from scratch in TypeScript. Local-first, multi-channel, tool-using, self-extending, security-hardened — with a web admin dashboard for runtime control.
 
 ## Quick Start
 
