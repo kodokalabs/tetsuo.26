@@ -1,13 +1,20 @@
 // ============================================================
 // LLM — Unified interface for Anthropic, OpenAI, and Ollama
+// Supports per-call provider/model overrides for multi-agent.
 // ============================================================
 
 import Anthropic from '@anthropic-ai/sdk';
 import { llmConfig } from '../config.js';
 import { createLogger } from '../utils/logger.js';
-import type { LLMMessage, LLMResponse, ToolDefinition, ToolCall } from '../types.js';
+import type { LLMMessage, LLMResponse, LLMProvider, ToolDefinition, ToolCall } from '../types.js';
 
 const log = createLogger('LLM');
+
+/** Optional overrides for sub-agent routing */
+export interface LLMCallOptions {
+  provider?: LLMProvider;
+  model?: string;
+}
 
 // ---- Anthropic adapter ---------------------------------------
 
@@ -15,10 +22,10 @@ async function callAnthropic(
   messages: LLMMessage[],
   tools: ToolDefinition[],
   systemPrompt: string,
+  model?: string,
 ): Promise<LLMResponse> {
   const client = new Anthropic({ apiKey: llmConfig.anthropicApiKey });
 
-  // Separate system message; convert rest to Anthropic format
   const apiMessages = messages
     .filter(m => m.role !== 'system')
     .map(m => {
@@ -45,14 +52,13 @@ async function callAnthropic(
   }));
 
   const response = await client.messages.create({
-    model: llmConfig.anthropicModel,
+    model: model || llmConfig.anthropicModel,
     max_tokens: 8192,
     system: systemPrompt,
     messages: apiMessages,
     tools: anthropicTools.length > 0 ? anthropicTools : undefined,
   });
 
-  // Parse response
   let text = '';
   const toolCalls: ToolCall[] = [];
 
@@ -144,30 +150,57 @@ async function callOpenAICompatible(
   };
 }
 
-// ---- Unified interface ---------------------------------------
+// ---- Unified interface with per-call overrides ---------------
 
+/**
+ * Call an LLM with optional provider/model override.
+ * The third argument can be either a system prompt string (backward compat)
+ * or a ToolDefinition[] (in which case system prompt is extracted from messages).
+ * The fourth argument is optional overrides for sub-agent routing.
+ */
 export async function callLLM(
   messages: LLMMessage[],
   tools: ToolDefinition[],
-  systemPrompt: string,
+  systemPromptOrOptions?: string | LLMCallOptions,
+  options?: LLMCallOptions,
 ): Promise<LLMResponse> {
-  const provider = llmConfig.provider;
-  log.info(`Calling ${provider} (${tools.length} tools available)`);
+  // Handle flexible call signatures
+  let systemPrompt: string;
+  let opts: LLMCallOptions;
+
+  if (typeof systemPromptOrOptions === 'string') {
+    systemPrompt = systemPromptOrOptions;
+    opts = options || {};
+  } else {
+    // Extract system prompt from messages array
+    const sysMsg = messages.find(m => m.role === 'system');
+    systemPrompt = sysMsg ? (typeof sysMsg.content === 'string' ? sysMsg.content : '') : '';
+    opts = systemPromptOrOptions || {};
+  }
+
+  const provider = opts.provider || llmConfig.provider;
+  const model = opts.model;
+
+  log.info(`Calling ${provider}${model ? `/${model}` : ''} (${tools.length} tools)`);
 
   switch (provider) {
     case 'anthropic':
-      return callAnthropic(messages, tools, systemPrompt);
+      return callAnthropic(messages, tools, systemPrompt, model);
 
     case 'openai':
       return callOpenAICompatible(
         messages, tools, systemPrompt,
-        'https://api.openai.com', llmConfig.openaiApiKey, llmConfig.openaiModel,
+        'https://api.openai.com',
+        llmConfig.openaiApiKey,
+        model || llmConfig.openaiModel,
       );
 
     case 'ollama':
       return callOpenAICompatible(
         messages, tools, systemPrompt,
-        llmConfig.ollamaBaseUrl, '', llmConfig.ollamaModel,
+        llmConfig.ollamaBaseUrl,
+        '',
+        model || llmConfig.ollamaModel,
       );
 
     default:

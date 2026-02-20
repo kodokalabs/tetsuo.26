@@ -13,12 +13,24 @@ import { createLogger } from './utils/logger.js';
 import { initAuditLog, closeAuditLog } from './security/guard.js';
 import { loadSettings } from './security/settings.js';
 
-// Import tools first (registers built-in tools)
+// Import tools (registers built-in tools on import)
 import './tools/registry.js';
-import './memory/store.js'; // registers memory tools
-import './tools/system.js'; // system control (guarded by permissions)
-import './tools/email.js';  // email IMAP/SMTP (guarded by permissions)
-import './tools/social.js'; // GitHub, Mastodon, Reddit (guarded by permissions)
+import './memory/store.js';
+import './tools/system.js';
+import './tools/email.js';
+import './tools/social.js';
+import './tools/tasks.js';    // task queue + orchestration tools
+
+// Task infrastructure
+import { initTaskQueue } from './tasks/queue.js';
+import { initApprovalQueue } from './tasks/approvals.js';
+import { initCostTracker } from './tasks/costs.js';
+
+// Orchestrator
+import { initModelRouter } from './orchestrator/router.js';
+
+// Triggers
+import { initTriggers, stopAllTriggers } from './triggers/engine.js';
 
 import { loadSkills } from './skills/loader.js';
 import { startHeartbeat, stopHeartbeat } from './heartbeat/scheduler.js';
@@ -30,9 +42,9 @@ import {
   sendMessage,
 } from './channels/adapters.js';
 import { startGateway } from './gateway/server.js';
-import { processMessage, processHeartbeat } from './gateway/agent.js';
+import { processMessage, processHeartbeat, processTrigger } from './gateway/agent.js';
 
-import type { InboundMessage, OutboundMessage } from './types.js';
+import type { InboundMessage, OutboundMessage, TriggerDefinition } from './types.js';
 
 const log = createLogger('Main');
 
@@ -43,7 +55,7 @@ function printBanner(): void {
   ╔══════════════════════════════════════════╗
   ║                                          ║
   ║   🤖  ${chalk.bold(agentConfig.name)}                       ║
-  ║   Autonomous Agent v0.1.0                ║
+  ║   Autonomous Agent v0.2.0                ║
   ║                                          ║
   ║   Provider:  ${agentConfig.provider.padEnd(26)}║
   ║   Model:     ${agentConfig.model.slice(0, 26).padEnd(26)}║
@@ -92,6 +104,36 @@ async function handleHeartbeat(tasks: { description: string }[]): Promise<void> 
     }
   } catch (err: any) {
     log.error(`Heartbeat processing failed: ${err.message}`);
+  }
+}
+
+// ---- Trigger Handler -----------------------------------------
+
+async function handleTrigger(trigger: TriggerDefinition, payload: unknown): Promise<void> {
+  const channel = trigger.action.channel || heartbeatConfig.channel;
+  const userId = trigger.action.userId || agentConfig.allowedUserIds[0] || 'owner';
+
+  try {
+    if (trigger.action.type === 'message') {
+      // Send a message to the configured channel
+      await sendMessage({
+        channel: channel as any,
+        userId,
+        text: `⚡ *Trigger: ${trigger.name}*\n\n${trigger.action.content}\n\nPayload: ${JSON.stringify(payload).slice(0, 500)}`,
+      });
+    } else if (trigger.action.type === 'task') {
+      // Process the trigger through the agent for intelligent handling
+      const reply = await processTrigger(trigger, payload);
+      if (reply) {
+        await sendMessage({
+          channel: channel as any,
+          userId,
+          text: `⚡ *Trigger: ${trigger.name}*\n\n${reply}`,
+        });
+      }
+    }
+  } catch (err: any) {
+    log.error(`Trigger handling failed for "${trigger.name}": ${err.message}`);
   }
 }
 
@@ -154,27 +196,40 @@ function startCLI(): void {
 async function main(): Promise<void> {
   printBanner();
 
-  // Ensure workspace exists
-  await fs.mkdir(agentConfig.workspace, { recursive: true });
-  await fs.mkdir(path.join(agentConfig.workspace, 'skills'), { recursive: true });
-  await fs.mkdir(path.join(agentConfig.workspace, 'memory'), { recursive: true });
+  // Ensure workspace directories
+  const dirs = ['skills', 'memory', 'memory/conversations', 'memory/facts', 'memory/tasks', 'tasks', 'approvals', 'logs'];
+  for (const dir of dirs) {
+    await fs.mkdir(path.join(agentConfig.workspace, dir), { recursive: true });
+  }
 
-  // Initialize security audit log
+  // Initialize security
   if (securityConfig.auditLogEnabled) {
     await initAuditLog();
     log.info('Audit logging enabled');
   }
 
-  // Load runtime settings (admin-configurable)
+  // Load runtime settings
   const settings = await loadSettings();
-  log.info(`Runtime settings loaded (autonomy: ${settings.autonomyLevel}, system control: ${settings.toolPermissions.systemControl ? 'ON' : 'off'})`);
+  log.info(`Settings loaded (autonomy: ${settings.autonomyLevel})`);
+
+  // Initialize task infrastructure
+  await initTaskQueue();
+  await initApprovalQueue();
+  await initCostTracker();
+  log.info('Task queue, approvals, and cost tracker initialized');
+
+  // Initialize model router for multi-agent orchestration
+  initModelRouter();
+  log.info('Model router initialized');
+
+  // Initialize event triggers
+  await initTriggers();
 
   // Load skills
-  log.info('Loading skills...');
   const skills = await loadSkills();
   log.info(`${skills.length} skills loaded`);
 
-  // Wire up event handlers
+  // Wire event handlers
   eventBus.on('message_received', (event) => {
     if (event.type === 'message_received') {
       handleInboundMessage(event.message);
@@ -184,6 +239,12 @@ async function main(): Promise<void> {
   eventBus.on('heartbeat_tick', (event) => {
     if (event.type === 'heartbeat_tick') {
       handleHeartbeat(event.tasks);
+    }
+  });
+
+  eventBus.on('trigger_fired', (event) => {
+    if (event.type === 'trigger_fired') {
+      handleTrigger(event.trigger, event.payload);
     }
   });
 
@@ -207,12 +268,13 @@ async function main(): Promise<void> {
   // Start gateway
   await startGateway();
 
-  // Start CLI (interactive mode)
+  // Start CLI
   startCLI();
 
   log.info(`${agentConfig.name} is ready! 🚀`);
-  log.info(`Admin dashboard: http://${gatewayConfig.host}:${gatewayConfig.port}/admin`);
-  log.info(`Gateway token in: ${agentConfig.workspace}/.gateway-token`);
+  log.info(`Admin: http://${gatewayConfig.host}:${gatewayConfig.port}/admin`);
+  log.info(`Token: ${agentConfig.workspace}/.gateway-token`);
+  log.info(`Chat commands: /approve, /reject, /pending, /tasks, /cost, /status, /quit`);
 }
 
 // ---- Shutdown ------------------------------------------------
@@ -220,6 +282,7 @@ async function main(): Promise<void> {
 async function shutdown(): Promise<void> {
   log.info('Shutting down...');
   stopHeartbeat();
+  stopAllTriggers();
   await closeAuditLog();
   process.exit(0);
 }
